@@ -1,0 +1,58 @@
+name: build-2.3.6
+on:
+  push:
+    branches: [ "ci/build-2.3.6" ]
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+      - name: Build and test
+        run: mvn -B -ntp clean install
+      - name: Test results
+        if: always()
+        run: |
+          t=0; f=0; e=0; s=0
+          for x in target/surefire-reports/TEST-*.xml; do
+            n=$(basename $x .xml | sed 's/TEST-//')
+            a=$(grep -o 'tests="[0-9]*"' $x | head -1 | grep -o '[0-9]*'); b=$(grep -o 'failures="[0-9]*"' $x | head -1 | grep -o '[0-9]*')
+            c=$(grep -o 'errors="[0-9]*"' $x | head -1 | grep -o '[0-9]*'); d=$(grep -o 'skipped="[0-9]*"' $x | head -1 | grep -o '[0-9]*')
+            echo "::notice title=TEST ${n##*.}::tests=$a failures=$b errors=$c skipped=$d"
+            t=$((t+a)); f=$((f+b)); e=$((e+c)); s=$((s+d))
+          done
+          echo "::notice title=TEST TOTAL::tests=$t failures=$f errors=$e skipped=$s"
+      - name: Verify bundled libraries
+        run: |
+          set -euo pipefail
+          cd target
+          ls -l ProcessMonitor-*.zip process-monitoring-extension.jar
+          unzip -o -q process-monitoring-extension.jar 'META-INF/maven/*' -d shaded
+          for f in $(find shaded -name pom.properties | sort); do
+            echo "$(grep '^groupId=' $f | cut -d= -f2):$(grep '^artifactId=' $f | cut -d= -f2):$(grep '^version=' $f | cut -d= -f2)"
+          done > libs.txt
+          echo "::notice title=SHADED LIBS::$(tr '\n' ' ' < libs.txt)"
+          fail=0
+          grep -E 'jetty.*:9\.' libs.txt && { echo "::error title=CHECK::Jetty 9.x still bundled"; fail=1; } || echo "::notice title=CHECK::no Jetty 9.x"
+          grep -E 'jackson-(core|databind):2\.(1[0-9]|2[01])\.|jackson-(core|databind):2\.22\.[012]$' libs.txt && { echo "::error title=CHECK::Jackson older than 2.22.3"; fail=1; } || echo "::notice title=CHECK::Jackson >= 2.22.3"
+          grep -E 'commons-lang3:3\.([0-9]|1[0-7])(\.|$)' libs.txt && { echo "::error title=CHECK::commons-lang3 older than 3.18"; fail=1; } || echo "::notice title=CHECK::commons-lang3 >= 3.18"
+          unzip -l process-monitoring-extension.jar | grep -q 'org/apache/log4j/' && { echo "::error title=CHECK::log4j 1.x classes present"; fail=1; } || echo "::notice title=CHECK::no log4j 1.x classes"
+          for c in core/json/PackageVersion databind/cfg/PackageVersion; do
+            v=$(unzip -p process-monitoring-extension.jar com/fasterxml/jackson/$c.class | strings | grep -E '^2\.[0-9]+\.[0-9]+' | head -1)
+            echo "::notice title=CLASS VERSION::jackson $c = $v"
+            [ "$v" = "2.22.3" ] || { echo "::error title=CHECK::bundled jackson $c classes are $v"; fail=1; }
+          done
+          echo "::notice title=CHECK::zip contents $(unzip -l ProcessMonitor-*.zip | awk 'NR>3{print $4}' | grep -v '^$' | tr '\n' ' ')"
+          exit $fail
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ProcessMonitor-2.3.6
+          path: |
+            target/ProcessMonitor-*.zip
+            target/libs.txt
